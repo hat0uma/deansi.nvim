@@ -1,0 +1,77 @@
+---
+name: CI
+on:
+  pull_request: ~
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  stylua:
+    name: Check code style
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: JohnnyMorganz/stylua-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          version: latest
+          args: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && '' || '--check ' }}--config-path=.stylua.toml ./lua ./tests ./plugin
+      - name: Commit and push changes
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: stefanzweifel/git-auto-commit-action@v4
+        with:
+          commit_message: "style(format): fix code style"
+          branch: ${{ github.head_ref }}
+
+  selene:
+    name: Lint code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NTBBloodbath/selene-action@v1.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          args: --color always ./lua ./tests ./plugin
+
+  tests:
+    name: Run tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        neovim_version: ["v0.10.1", "nightly"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare plenary
+        run: |
+          git clone --depth 1 https://github.com/nvim-lua/plenary.nvim ~/.local/share/nvim/site/pack/vendor/start/plenary.nvim
+          ln -s "$(pwd)" ~/.local/share/nvim/site/pack/vendor/start
+
+      - name: Setup neovim
+        uses: rhysd/action-setup-vim@v1
+        with:
+          neovim: true
+          version: ${{ matrix.neovim_version }}
+
+      - name: Run tests
+        run: |
+          nvim --headless --noplugin -u tests/minimal.vim -c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal.vim'}"
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [tests]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          release-type: simple

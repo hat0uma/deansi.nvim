@@ -1,0 +1,439 @@
+local M = {}
+
+local ESC = string.char(0x1B)
+
+---@class deansi.Range
+---@field lnum number Start line number
+---@field col number Start column number
+
+---@alias deansi.AnsiCommand deansi.AnsiCommand.SGR | deansi.AnsiCommand.Other
+
+---@class deansi.AnsiCommand.SGR
+---@field type "sgr"
+---@field start deansi.Range Start position in the text
+---@field stop deansi.Range End position in the text
+---@field params number[] SGR parameters (e.g., {1, 31} for bold red text)
+
+---@class deansi.AnsiCommand.Other
+---@field type "other"
+---@field start deansi.Range Start position in the text
+---@field stop deansi.Range End position in the text
+
+---@class deansi.Color
+---@field type "standard" | "256" | "rgb"
+---@field value string | number Color value
+---@field r number? Red component (for RGB)
+---@field g number? Green component (for RGB)
+---@field b number? Blue component (for RGB)
+
+---@class deansi.Style
+---@field fg deansi.Color? Foreground color
+---@field bg deansi.Color? Background color
+---@field bold boolean?
+---@field dim boolean?
+---@field italic boolean?
+---@field underline boolean?
+---@field blink boolean?
+---@field reverse boolean?
+---@field strikethrough boolean?
+
+---@class deansi.Parser.Callback
+---@field on_command fun(command: deansi.AnsiCommand)
+---@field on_text fun(text: string)
+---@field on_error fun(err: string)
+
+---@class deansi.Parser
+local Parser = {}
+Parser.__index = Parser
+
+--- Create a new Parser.
+---@return deansi.Parser
+function Parser:new()
+  local obj = {}
+  setmetatable(obj, self)
+  return obj
+end
+
+--- Parse ANSI escape sequences from text
+---@param text string The text containing ANSI escape codes
+---@return deansi.ParsedText
+function Parser:parse_text(text)
+  local result = {
+    text = text,
+    clean_text = "",
+    commands = {},
+    conceal_ranges = {},
+  }
+
+  local pos = 1
+  local clean_text = {}
+
+  while pos <= #text do
+    local esc_start = text:find("\27", pos)
+    if not esc_start then
+      -- No more escape sequences, add remaining text
+      table.insert(clean_text, text:sub(pos))
+      break
+    end
+
+    -- Add text before escape sequence
+    if esc_start > pos then
+      local before_text = text:sub(pos, esc_start - 1)
+      table.insert(clean_text, before_text)
+    end
+
+    -- Parse escape sequence
+    local seq_start = esc_start
+    local seq_end = self:_find_sequence_end(text, esc_start)
+
+    if seq_end then
+      local sequence = text:sub(seq_start, seq_end)
+      local command = self:_parse_escape_sequence(sequence, seq_start, seq_end)
+
+      if command then
+        table.insert(result.commands, command)
+        table.insert(result.conceal_ranges, { seq_start, seq_end })
+      end
+
+      pos = seq_end + 1
+    else
+      -- Invalid escape sequence, treat as regular text
+      table.insert(clean_text, text:sub(esc_start, esc_start))
+      pos = esc_start + 1
+    end
+  end
+
+  result.clean_text = table.concat(clean_text)
+  return result
+end
+
+--- Find the end of an ANSI escape sequence
+---@param text string
+---@param start number
+---@return number|nil
+function Parser:_find_sequence_end(text, start)
+  local pos = start + 1 -- Skip ESC character
+
+  if pos > #text then
+    return nil
+  end
+
+  -- Check for CSI (Control Sequence Introducer): ESC[
+  if text:sub(pos, pos) == "[" then
+    pos = pos + 1
+    -- Find the final character (A-Z, a-z)
+    while pos <= #text do
+      local char = text:sub(pos, pos)
+      if char:match("[A-Za-z]") then
+        return pos
+      elseif char:match("[0-9;:<=>?@]") then
+        pos = pos + 1
+      else
+        -- Invalid character in CSI sequence
+        return nil
+      end
+    end
+  end
+
+  -- Check for other escape sequences
+  -- ESC( for character set selection
+  -- ESC) for character set selection
+  -- ESC] for operating system commands
+  if pos <= #text and text:sub(pos, pos):match("[()%]^_]") then
+    pos = pos + 1
+    -- For OSC sequences (ESC]), find ST (String Terminator) or BEL
+    if text:sub(pos - 1, pos - 1) == "]" then
+      while pos <= #text do
+        local char = text:sub(pos, pos)
+        if char == "\07" then -- BEL
+          return pos
+        elseif char == "\27" and pos + 1 <= #text and text:sub(pos + 1, pos + 1) == "\\" then -- ST
+          return pos + 1
+        end
+        pos = pos + 1
+      end
+    elseif pos <= #text then
+      return pos
+    end
+  end
+
+  return nil
+end
+
+--- Parse an escape sequence into a command
+---@param sequence string
+---@param start_pos number
+---@param end_pos number
+---@return deansi.AnsiCommand|nil
+function Parser:_parse_escape_sequence(sequence, start_pos, end_pos)
+  -- Handle CSI sequences (ESC[...)
+  if sequence:match("^\27%[") then
+    local params_str = sequence:sub(3, -2) -- Remove ESC[ and final character
+    local final_char = sequence:sub(-1)
+
+    -- SGR (Select Graphic Rendition) - ESC[...m
+    if final_char == "m" then
+      local params = {}
+      if params_str ~= "" then
+        for param in params_str:gmatch("([^;]+)") do
+          local num = tonumber(param)
+          if num then
+            table.insert(params, num)
+          else
+            -- Handle empty parameters as 0
+            table.insert(params, 0)
+          end
+        end
+      else
+        -- Empty parameters default to 0 (reset)
+        params = { 0 }
+      end
+
+      return {
+        type = "sgr",
+        start_pos = start_pos,
+        end_pos = end_pos,
+        params = params,
+        raw = sequence,
+      }
+    end
+
+    -- Other CSI sequences
+    return {
+      type = "other",
+      start_pos = start_pos,
+      end_pos = end_pos,
+      params = {},
+      raw = sequence,
+    }
+  end
+
+  -- Non-CSI escape sequences
+  return {
+    type = "other",
+    start_pos = start_pos,
+    end_pos = end_pos,
+    params = {},
+    raw = sequence,
+  }
+end
+
+--- Parse a buffer with ANSI escape codes.
+---@param bufnr number The buffer number to parse.
+---@return deansi.ParsedText[]
+function Parser:parse_buffer(bufnr)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local results = {}
+
+  for i, line in ipairs(lines) do
+    local parsed = self:parse_text(line)
+    parsed.line_nr = i
+    table.insert(results, parsed)
+  end
+
+  return results
+end
+
+--- Parse a chunk of text with ANSI escape codes.
+---@param chunk string[] The chunk of text to parse.
+---@return deansi.ParsedText[]
+function Parser:parse_chunk(chunk)
+  local results = {}
+
+  for i, line in ipairs(chunk) do
+    local parsed = self:parse_text(line)
+    parsed.line_nr = i
+    table.insert(results, parsed)
+  end
+
+  return results
+end
+
+--- Convert SGR parameters to style information
+---@param params number[]
+---@return deansi.Style
+function Parser:sgr_to_style(params)
+  local style = {}
+  local i = 1
+
+  while i <= #params do
+    local param = params[i]
+
+    if param == 0 then
+      -- Reset all attributes
+      style = {}
+    elseif param == 1 then
+      style.bold = true
+    elseif param == 2 then
+      style.dim = true
+    elseif param == 3 then
+      style.italic = true
+    elseif param == 4 then
+      style.underline = true
+    elseif param == 5 then
+      style.blink = true
+    elseif param == 7 then
+      style.reverse = true
+    elseif param == 9 then
+      style.strikethrough = true
+    elseif param == 22 then
+      style.bold = false
+      style.dim = false
+    elseif param == 23 then
+      style.italic = false
+    elseif param == 24 then
+      style.underline = false
+    elseif param == 25 then
+      style.blink = false
+    elseif param == 27 then
+      style.reverse = false
+    elseif param == 29 then
+      style.strikethrough = false
+    elseif param >= 30 and param <= 37 then
+      -- Standard foreground colors
+      local colors = { "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white" }
+      style.fg = { type = "standard", value = colors[param - 29] }
+    elseif param == 38 then
+      -- Extended foreground color
+      if i + 1 <= #params then
+        local color_type = params[i + 1]
+        if color_type == 5 and i + 2 <= #params then
+          -- 8-bit color (256 colors)
+          local color_value = params[i + 2]
+          style.fg = { type = "256", value = color_value }
+          i = i + 2
+        elseif color_type == 2 and i + 4 <= #params then
+          -- 24-bit RGB color
+          local r, g, b = params[i + 2], params[i + 3], params[i + 4]
+          style.fg = { type = "rgb", r = r, g = g, b = b, value = string.format("#%02x%02x%02x", r, g, b) }
+          i = i + 4
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    elseif param == 39 then
+      -- Default foreground color
+      style.fg = nil
+    elseif param >= 40 and param <= 47 then
+      -- Standard background colors
+      local colors = { "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white" }
+      style.bg = { type = "standard", value = colors[param - 39] }
+    elseif param == 48 then
+      -- Extended background color
+      if i + 1 <= #params then
+        local color_type = params[i + 1]
+        if color_type == 5 and i + 2 <= #params then
+          -- 8-bit color (256 colors)
+          local color_value = params[i + 2]
+          style.bg = { type = "256", value = color_value }
+          i = i + 2
+        elseif color_type == 2 and i + 4 <= #params then
+          -- 24-bit RGB color
+          local r, g, b = params[i + 2], params[i + 3], params[i + 4]
+          style.bg = { type = "rgb", r = r, g = g, b = b, value = string.format("#%02x%02x%02x", r, g, b) }
+          i = i + 4
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    elseif param == 49 then
+      -- Default background color
+      style.bg = nil
+    elseif param >= 90 and param <= 97 then
+      -- Bright foreground colors
+      local colors = {
+        "bright_black",
+        "bright_red",
+        "bright_green",
+        "bright_yellow",
+        "bright_blue",
+        "bright_magenta",
+        "bright_cyan",
+        "bright_white",
+      }
+      style.fg = { type = "standard", value = colors[param - 89] }
+    elseif param >= 100 and param <= 107 then
+      -- Bright background colors
+      local colors = {
+        "bright_black",
+        "bright_red",
+        "bright_green",
+        "bright_yellow",
+        "bright_blue",
+        "bright_magenta",
+        "bright_cyan",
+        "bright_white",
+      }
+      style.bg = { type = "standard", value = colors[param - 99] }
+    end
+
+    i = i + 1
+  end
+
+  return style
+end
+
+--- Convert 256-color palette index to RGB values
+---@param index number Color index (0-255)
+---@return number, number, number RGB values
+function Parser:palette_to_rgb(index)
+  if index < 0 or index > 255 then
+    return 0, 0, 0
+  end
+
+  -- Standard colors (0-15)
+  if index < 16 then
+    local standard_colors = {
+      { 0, 0, 0 }, -- black
+      { 128, 0, 0 }, -- red
+      { 0, 128, 0 }, -- green
+      { 128, 128, 0 }, -- yellow
+      { 0, 0, 128 }, -- blue
+      { 128, 0, 128 }, -- magenta
+      { 0, 128, 128 }, -- cyan
+      { 192, 192, 192 }, -- white
+      { 128, 128, 128 }, -- bright black
+      { 255, 0, 0 }, -- bright red
+      { 0, 255, 0 }, -- bright green
+      { 255, 255, 0 }, -- bright yellow
+      { 0, 0, 255 }, -- bright blue
+      { 255, 0, 255 }, -- bright magenta
+      { 0, 255, 255 }, -- bright cyan
+      { 255, 255, 255 }, -- bright white
+    }
+    return unpack(standard_colors[index + 1])
+  end
+
+  -- 216 color cube (16-231)
+  if index >= 16 and index <= 231 then
+    local cube_index = index - 16
+    local r = math.floor(cube_index / 36)
+    local g = math.floor((cube_index % 36) / 6)
+    local b = cube_index % 6
+
+    local function cube_value(v)
+      if v == 0 then
+        return 0
+      end
+      return 55 + v * 40
+    end
+
+    return cube_value(r), cube_value(g), cube_value(b)
+  end
+
+  -- Grayscale ramp (232-255)
+  if index >= 232 and index <= 255 then
+    local gray = 8 + (index - 232) * 10
+    return gray, gray, gray
+  end
+
+  return 0, 0, 0
+end
+
+M.Parser = Parser
+
+return M

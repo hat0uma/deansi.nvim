@@ -1,0 +1,250 @@
+local M = {}
+
+---@alias deansi.Color
+--- | string -- Standard color names (e.g., "red", "green", "blue") or 24-bit RGB color codes (e.g., "#ff0000")
+--- | integer -- 256-color index (0-255)
+
+---@class deansi.Style
+---@field fg deansi.Color? Foreground color
+---@field bg deansi.Color? Background color
+---@field bold boolean?
+---@field dim boolean?
+---@field italic boolean?
+---@field underline boolean?
+---@field blink boolean?
+---@field reverse boolean?
+---@field strikethrough boolean?
+
+--- Convert an index to a color name
+---@param idx integer Index of the color (1-8)
+---@param bright boolean Whether to use bright colors
+---@return string Color name
+function M.idx_to_color(idx, bright)
+  -- Adjust index for bright colors
+  idx = bright and (idx + 8) or idx
+
+  local colors = {
+    [1] = "Black",
+    [2] = "DarkRed",
+    [3] = "DarkGreen",
+    [4] = "Brown",
+    [5] = "DarkBlue",
+    [6] = "DarkMagenta",
+    [7] = "DarkCyan",
+    [8] = "Gray",
+    [9] = "DarkGray",
+    [10] = "Red",
+    [11] = "Green",
+    [12] = "Yellow",
+    [13] = "Blue",
+    [14] = "Magenta",
+    [15] = "Cyan",
+    [16] = "White",
+  }
+
+  if idx < 1 or idx > #colors then
+    error("Index out of range: " .. idx)
+  end
+
+  return colors[idx]
+end
+
+--- Convert SGR parameters to style information
+---@param params number[]
+---@return deansi.Style
+function M.sgr_to_style(params)
+  local style = {} ---@type deansi.Style
+  local i = 1
+
+  while i <= #params do
+    local param = params[i]
+
+    if param == 0 then
+      -- Reset all attributes
+      style = {}
+    elseif param == 1 then
+      style.bold = true
+    elseif param == 2 then
+      style.dim = true
+    elseif param == 3 then
+      style.italic = true
+    elseif param == 4 then
+      style.underline = true
+    elseif param == 5 then
+      style.blink = true
+    elseif param == 7 then
+      style.reverse = true
+    elseif param == 9 then
+      style.strikethrough = true
+    elseif param == 22 then
+      style.bold = false
+      style.dim = false
+    elseif param == 23 then
+      style.italic = false
+    elseif param == 24 then
+      style.underline = false
+    elseif param == 25 then
+      style.blink = false
+    elseif param == 27 then
+      style.reverse = false
+    elseif param == 29 then
+      style.strikethrough = false
+    elseif param >= 30 and param <= 37 then
+      -- Standard foreground colors
+      style.fg = M.idx_to_color(param - 29, false)
+    elseif param == 38 then
+      -- Extended foreground color
+      if i + 1 <= #params then
+        local color_type = params[i + 1]
+        if color_type == 5 then
+          -- 8-bit color (256 colors)
+          -- Format: 38:5:n or 38;5;n
+          if i + 2 <= #params then
+            local color_value = params[i + 2]
+            style.fg = color_value
+            i = i + 2
+          else
+            i = i + 1
+          end
+        elseif color_type == 2 then
+          -- 24-bit RGB color
+          -- Traditional format: 38;2;r;g;b
+          -- ITU-T T.416 format: 38:2::r:g:b or 38:2:colorspace:r:g:b
+          local next_idx = i + 2
+
+          -- Skip color space parameter if present (ITU-T T.416)
+          -- In the format 38:2::r:g:b, there's an empty color space parameter
+          -- In the format 38:2:0:r:g:b, 0 indicates default sRGB color space
+          if next_idx <= #params and next_idx + 3 <= #params then
+            local colorspace = params[next_idx]
+            local r, g, b
+
+            if colorspace == 0 or next_idx + 3 == #params then
+              -- Default sRGB color space or traditional format
+              r, g, b = params[next_idx + 1], params[next_idx + 2], params[next_idx + 3]
+              i = next_idx + 3
+            else
+              -- Color space specified, skip it for now (treat as sRGB)
+              r, g, b = params[next_idx + 1], params[next_idx + 2], params[next_idx + 3]
+              i = next_idx + 3
+            end
+
+            if r and g and b then
+              style.fg = string.format("#%02x%02x%02x", r, g, b)
+            end
+          elseif next_idx <= #params and next_idx + 2 <= #params then
+            -- Traditional format without color space: 38;2;r;g;b
+            local r, g, b = params[next_idx], params[next_idx + 1], params[next_idx + 2]
+            style.fg = string.format("#%02x%02x%02x", r, g, b)
+            i = next_idx + 2
+          else
+            i = i + 1
+          end
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    elseif param == 39 then
+      -- Default foreground color
+      style.fg = nil
+    elseif param >= 40 and param <= 47 then
+      -- Standard background colors
+      style.bg = M.idx_to_color(param - 39, false)
+    elseif param == 48 then
+      -- Extended background color
+      if i + 1 <= #params then
+        local color_type = params[i + 1]
+        if color_type == 5 then
+          -- 8-bit color (256 colors)
+          -- Format: 48:5:n or 48;5;n
+          if i + 2 <= #params then
+            local color_value = params[i + 2]
+            style.bg = color_value
+            i = i + 2
+          else
+            i = i + 1
+          end
+        elseif color_type == 2 then
+          -- 24-bit RGB color
+          -- formats:
+          --   48;2;r;g;b               -> R, G, B values
+          --   48:2::r:g:b              -> R, G, B values with empty color space(default sRGB)
+          --   48:2:colorspace:v1:v2:v3:v4 -> values with specified color space(CMY, HSL, etc.)
+          local next_idx = i + 2
+
+          -- Skip color space parameter if present
+          if next_idx <= #params and next_idx + 3 <= #params then
+            local colorspace = params[next_idx]
+            local r, g, b
+
+            if colorspace == 0 or next_idx + 3 == #params then
+              -- Default sRGB color space or traditional format
+              r, g, b = params[next_idx + 1], params[next_idx + 2], params[next_idx + 3]
+              i = next_idx + 3
+            else
+              -- Color space specified, skip it for now (treat as sRGB)
+              r, g, b = params[next_idx + 1], params[next_idx + 2], params[next_idx + 3]
+              i = next_idx + 3
+            end
+
+            if r and g and b then
+              style.bg = string.format("#%02x%02x%02x", r, g, b)
+            end
+          elseif next_idx <= #params and next_idx + 2 <= #params then
+            -- Traditional format without color space: 48;2;r;g;b
+            local r, g, b = params[next_idx], params[next_idx + 1], params[next_idx + 2]
+            style.bg = string.format("#%02x%02x%02x", r, g, b)
+            i = next_idx + 2
+          else
+            i = i + 1
+          end
+        else
+          i = i + 1
+        end
+      else
+        i = i + 1
+      end
+    elseif param == 49 then
+      -- Default background color
+      style.bg = nil
+    elseif param >= 90 and param <= 97 then
+      -- Bright foreground colors
+      style.fg = M.idx_to_color(param - 89, true)
+    elseif param >= 100 and param <= 107 then
+      -- Bright background colors
+      style.bg = M.idx_to_color(param - 99, true)
+    end
+
+    i = i + 1
+  end
+
+  return style
+end
+
+function M.color_to_code(color)
+  local colors = {
+    black = { 0, 0, 0 },
+    red = { 255, 0, 0 },
+    green = { 0, 255, 0 },
+    yellow = { 255, 255, 0 },
+    blue = { 0, 0, 255 },
+    magenta = { 255, 0, 255 },
+    cyan = { 0, 255, 255 },
+    white = { 255, 255, 255 },
+    bright_black = { 128, 128, 128 },
+    bright_red = { 255, 0, 0 },
+    bright_green = { 0, 255, 0 },
+    bright_yellow = { 255, 255, 0 },
+    bright_blue = { 0, 0, 255 },
+    bright_magenta = { 255, 0, 255 },
+    bright_cyan = { 0, 255, 255 },
+    bright_white = { 255, 255, 255 },
+  }
+
+  local rgb = colors[color]
+  return string.format("#%02x%02x%02x", rgb[1], rgb[2], rgb[3])
+end
+
+return M
