@@ -70,9 +70,6 @@ function M.enable(opts)
           strikethrough = current_style.strikethrough,
         })
         style_map[style_key] = hl_group
-        print("New style defined: " .. hl_group .. " index: " .. index)
-      else
-        print("Using existing style: " .. style_map[style_key])
       end
 
       -- highlight the text with the current style
